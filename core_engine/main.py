@@ -1,14 +1,17 @@
+import asyncio
 import json
+import os
 import time
 import logging
 from contextlib import asynccontextmanager
 from typing import List
 
+import pandas as pd
+import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .models import TelemetryPayload, AnomalyScoreResult
 from .telemetry_processor import TelemetryProcessor
 from .ml_pipeline import MLPipeline
 
@@ -28,16 +31,83 @@ ml_pipeline: MLPipeline = None
 telemetry_processor: TelemetryProcessor = None
 
 
+# ─────────────────────────────────────────────────────────────
+# Internal CSV Simulator (nasa_test2_features → WebSocket)
+# ─────────────────────────────────────────────────────────────
+DATASETS_DIR  = os.path.join(os.path.dirname(__file__), "..", "datasets")
+TEST_CSV_PATH = os.path.join(DATASETS_DIR, "nasa_test2_features.csv")
+SIMULATOR_HZ  = float(os.environ.get("SIMULATE_HZ", "2"))   # rows per second
+
+
+async def _run_csv_simulator():
+    """
+    Background task: stream rows from nasa_test2_features.csv into
+    the /ws/telemetry endpoint at SIMULATOR_HZ rows/second, looping forever.
+    The simulator connects to the local server over WebSocket so the ML
+    pipeline and broadcast logic are reused transparently.
+    """
+    # Give the server a moment to finish binding before we connect
+    await asyncio.sleep(3)
+
+    try:
+        df = pd.read_csv(TEST_CSV_PATH)[["max_vibration", "rms_vibration"]].dropna().reset_index(drop=True)
+        logger.info("[Simulator] Loaded %d rows from nasa_test2_features.csv", len(df))
+    except Exception as e:
+        logger.error("[Simulator] Could not load test CSV: %s", e)
+        return
+
+    total    = len(df)
+    idx      = 0
+    interval = 1.0 / SIMULATOR_HZ
+
+    # Determine the local WebSocket URL (same process, loopback)
+    port = int(os.environ.get("PORT", 8000))
+    local_ws = f"ws://127.0.0.1:{port}/ws/telemetry"
+
+    while True:
+        try:
+            logger.info("[Simulator] Connecting to %s ...", local_ws)
+            async with websockets.connect(local_ws, ping_interval=20, ping_timeout=10) as ws:
+                logger.info("[Simulator] Connected — streaming nasa_test2 @ %.1f Hz", SIMULATOR_HZ)
+                while True:
+                    row = df.iloc[idx % total]
+                    payload = json.dumps({
+                        "timestamp": time.time(),
+                        "max_vibration": float(row["max_vibration"]),
+                        "rms_vibration": float(row["rms_vibration"]),
+                    })
+                    await ws.send(payload)
+                    idx += 1
+                    await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info("[Simulator] Cancelled — shutting down.")
+            return
+        except Exception as e:
+            logger.warning("[Simulator] Connection error (%s). Retrying in 5 s …", e)
+            await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Train the model at startup, clean up on shutdown."""
+    """Train the model at startup, launch CSV simulator, clean up on shutdown."""
     global ml_pipeline, telemetry_processor
     logger.info("🚀 Project Aegis Core Engine starting up...")
     telemetry_processor = TelemetryProcessor(window_size=40)
     ml_pipeline = MLPipeline(contamination=0.05)
     logger.info("✅ Startup complete — ready to accept connections.")
+
+    # Start the internal nasa_test2 CSV simulator as a background task
+    sim_task = asyncio.create_task(_run_csv_simulator())
+    logger.info("🎬 CSV simulator task scheduled.")
+
     yield
+
     logger.info("🛑 Shutting down...")
+    sim_task.cancel()
+    try:
+        await sim_task
+    except asyncio.CancelledError:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────
