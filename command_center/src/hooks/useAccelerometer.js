@@ -83,13 +83,28 @@ export const useAccelerometer = (wsUrl) => {
   // ── DeviceMotion listener ────────────────────────────────────────────
   const attachMotionListener = useCallback(() => {
     const handler = (event) => {
-      const a = event.accelerationIncludingGravity || event.acceleration;
-      if (!a) return;
-      accelRef.current = {
-        x: a.x ?? 0,
-        y: a.y ?? 0,
-        z: a.z ?? 0,
-      };
+      // Prefer gravity-compensated acceleration (pure vibration signal).
+      // Fall back to accelerationIncludingGravity if unavailable (some Android).
+      // Convert m/s² → g by dividing by 9.81 to match CWRU/NASA training data units.
+      const G = 9.81;
+      let x = 0, y = 0, z = 0;
+
+      const a = event.acceleration;
+      const ag = event.accelerationIncludingGravity;
+
+      if (a && (a.x !== null || a.y !== null || a.z !== null)) {
+        // Gravity-removed: pure vibration (ideal)
+        x = (a.x ?? 0) / G;
+        y = (a.y ?? 0) / G;
+        z = (a.z ?? 0) / G;
+      } else if (ag) {
+        // Gravity included: subtract ~1g from Z to approximate vibration
+        x = (ag.x ?? 0) / G;
+        y = (ag.y ?? 0) / G;
+        z = ((ag.z ?? 0) - G) / G; // subtract gravity from Z axis
+      }
+
+      accelRef.current = { x, y, z };
     };
     window.addEventListener('devicemotion', handler);
     return () => window.removeEventListener('devicemotion', handler);
