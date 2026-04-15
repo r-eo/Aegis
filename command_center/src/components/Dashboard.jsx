@@ -155,27 +155,22 @@ export const Dashboard = () => {
     return () => { clearTimeout(retryTimer); wsRef.current?.close(); };
   }, [addTelemetry, setConnectionStatus]);
 
-  // ── Boot: fetch analytics + check simulator status ─────────────────────────
+  // ── Boot: fetch analytics ─────────────────────────
   useEffect(() => {
     const boot = async () => {
       try {
-        const [pcaR, statR, modR, simR] = await Promise.all([
+        const [pcaR, statR, modR] = await Promise.all([
           fetch(`${API_BASE}/api/pca-analytics`),
           fetch(`${API_BASE}/api/dataset-stats`),
           fetch(`${API_BASE}/api/model-info`),
-          fetch(`${API_BASE}/api/simulator/status`),
         ]);
         if (pcaR.ok)  setPcaAnalytics(await pcaR.json());
         if (statR.ok) setDatasetStats(await statR.json());
         if (modR.ok)  setModelInfo(await modR.json());
-        if (simR.ok) {
-          const s = await simR.json();
-          setSimulatorRunning(s.running);
-        }
       } catch (e) { console.warn('[Aegis] boot fetch failed', e); }
     };
     boot();
-  }, [setPcaAnalytics, setDatasetStats, setModelInfo, setSimulatorRunning]);
+  }, [setPcaAnalytics, setDatasetStats, setModelInfo]);
 
 
   // ── Derived chart data ─────────────────────────────────────
