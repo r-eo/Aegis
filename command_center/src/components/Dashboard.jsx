@@ -153,10 +153,19 @@ export const Dashboard = () => {
     if (!modelInfo?.static_metrics) return null;
     const sm = modelInfo.static_metrics;
     
+    // Support old schema vs new schema to prevent empty UI on render cache lag
+    const ifAcc = sm.isolation_forest?.accuracy ?? sm.accuracy ?? 0;
+    const cnnAcc = sm.supervised_cnn_proxy?.accuracy ?? 0;
+    const mlpR2 = sm.functional_mlp?.r2 ?? sm.r2 ?? 0;
+    const mlpMae = sm.functional_mlp?.mae ?? sm.mae ?? 0;
+    const gpUnc = sm.gaussian_process?.avg_uncertainty ?? 0;
+    const gpR2 = sm.gaussian_process?.r2 ?? 0;
+    const gpMae = sm.gaussian_process?.mae ?? 0;
+
     // Performance comparison for RUL predictors
     const modelComparisonData = [
-      { name: 'Functional MLP', r2: sm.functional_mlp?.r2 || 0, mae: sm.functional_mlp?.mae || 0 },
-      { name: 'Gaussian Process', r2: sm.gaussian_process?.r2 || 0, mae: sm.gaussian_process?.mae || 0 }
+      { name: 'Functional MLP', r2: mlpR2, mae: mlpMae },
+      { name: 'Gaussian Process', r2: gpR2, mae: gpMae }
     ];
 
     return (
@@ -170,23 +179,23 @@ export const Dashboard = () => {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 z-10 w-full mb-4">
           <div className="p-3 bg-[#0f172a88] rounded-xl border border-slate-700/50 backdrop-blur">
             <p className="text-[10px] text-slate-400 font-bold mb-1">UNSUPERVISED (IF)</p>
-            <p className="text-xl font-mono text-cyan-300">{sm.isolation_forest?.accuracy?.toFixed(1)}% ACC</p>
+            <p className="text-xl font-mono text-cyan-300">{ifAcc > 0 ? `${ifAcc.toFixed(1)}%` : '⏳'} ACC</p>
           </div>
           <div className="p-3 bg-[#0f172a88] rounded-xl border border-slate-700/50 backdrop-blur">
             <p className="text-[10px] text-slate-400 font-bold mb-1">SUPERVISED (RF-CNN)</p>
-            <p className="text-xl font-mono text-violet-300">{sm.supervised_cnn_proxy?.accuracy?.toFixed(1)}% ACC</p>
+            <p className="text-xl font-mono text-violet-300">{cnnAcc > 0 ? `${cnnAcc.toFixed(1)}%` : '⏳'} ACC</p>
           </div>
           <div className="p-3 bg-[#0f172a88] rounded-xl border border-slate-700/50 backdrop-blur">
             <p className="text-[10px] text-slate-400 font-bold mb-1">FDA MLP RUL (R²)</p>
-            <p className="text-xl font-mono text-emerald-300">{sm.functional_mlp?.r2?.toFixed(3)}</p>
+            <p className="text-xl font-mono text-emerald-300">{mlpR2 !== 0 ? mlpR2.toFixed(3) : '⏳'}</p>
           </div>
           <div className="p-3 bg-[#0f172a88] rounded-xl border border-slate-700/50 backdrop-blur">
             <p className="text-[10px] text-slate-400 font-bold mb-1">DGP UNCERTAINTY</p>
-            <p className="text-xl font-mono text-rose-300">±{sm.gaussian_process?.avg_uncertainty?.toFixed(3)} σ</p>
+            <p className="text-xl font-mono text-rose-300">{gpUnc > 0 ? `±${gpUnc.toFixed(3)} σ` : '⏳'}</p>
           </div>
         </div>
 
-        <div className="h-40 z-10 w-full mt-2">
+        <div className="h-48 z-10 w-full mt-2">
            <ResponsiveContainer width="100%" height="100%">
              <BarChart data={modelComparisonData} layout="vertical" margin={{ top: 0, right: 30, left: 30, bottom: 0 }}>
                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#1e293b" />
@@ -194,8 +203,8 @@ export const Dashboard = () => {
                <YAxis dataKey="name" type="category" stroke="#94a3b8" tick={{ fontSize: 11 }} width={120} />
                <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: '8px' }} />
                <Legend wrapperStyle={{ fontSize: 11 }} />
-               <Bar dataKey="r2" name="R² Score (Higher is Better)" fill={C.brand} radius={[0, 4, 4, 0]} barSize={12} />
-               <Bar dataKey="mae" name="MAE Error (Lower is Better)" fill={C.cyan} radius={[0, 4, 4, 0]} barSize={12} />
+               <Bar dataKey="r2" name="R² Score (Higher is Better)" fill={C.brand} radius={[0, 4, 4, 0]} barSize={14} />
+               <Bar dataKey="mae" name="MAE Error (Lower is Better)" fill={C.cyan} radius={[0, 4, 4, 0]} barSize={14} />
              </BarChart>
            </ResponsiveContainer>
         </div>
@@ -282,30 +291,54 @@ export const Dashboard = () => {
           </div>
 
           {/* Timeseries Charts */}
-          <div className="col-span-12 lg:col-span-8 p-5 rounded-[20px] border flex flex-col" style={{ background: C.card, borderColor: C.border }}>
-             <SectionTitle>High-Frequency Vibration Telemetry (NASA Test 2 Pipeline)</SectionTitle>
-             <div className="h-64 mt-2">
-               <ResponsiveContainer width="100%" height="100%">
-                 <AreaChart data={chartData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
-                   <defs>
-                     <linearGradient id="gMax" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.brand} stopOpacity={0.4} /><stop offset="95%" stopColor={C.brand} stopOpacity={0} /></linearGradient>
-                     <linearGradient id="gRms" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.cyan} stopOpacity={0.4} /><stop offset="95%" stopColor={C.cyan} stopOpacity={0} /></linearGradient>
-                   </defs>
-                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                   <XAxis dataKey="i" hide />
-                   <YAxis stroke="#475569" tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
-                   <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 8, fontSize: 11 }} />
-                   <Legend wrapperStyle={{ fontSize: 11, paddingTop: 10 }} />
-                   <Area type="step" dataKey="max" name="Max Vibration (g)" stroke={C.brand} fill="url(#gMax)" strokeWidth={2} isAnimationActive={false} />
-                   <Area type="step" dataKey="rms" name="RMS Vibration (g)" stroke={C.cyan} fill="url(#gRms)" strokeWidth={2} isAnimationActive={false} />
-                 </AreaChart>
-               </ResponsiveContainer>
+          <div className="col-span-12 lg:col-span-8 space-y-4">
+             <div className="p-5 rounded-[20px] border flex flex-col" style={{ background: C.card, borderColor: C.border }}>
+               <SectionTitle>High-Frequency Vibration Telemetry (NASA Test 2 Pipeline)</SectionTitle>
+               <div className="h-64 mt-2">
+                 <ResponsiveContainer width="100%" height="100%">
+                   <AreaChart data={chartData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
+                     <defs>
+                       <linearGradient id="gMax" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.brand} stopOpacity={0.4} /><stop offset="95%" stopColor={C.brand} stopOpacity={0} /></linearGradient>
+                       <linearGradient id="gRms" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.cyan} stopOpacity={0.4} /><stop offset="95%" stopColor={C.cyan} stopOpacity={0} /></linearGradient>
+                     </defs>
+                     <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                     <XAxis dataKey="i" hide />
+                     <YAxis stroke="#475569" tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
+                     <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 8, fontSize: 11 }} />
+                     <Legend wrapperStyle={{ fontSize: 11, paddingTop: 10 }} />
+                     <Area type="step" dataKey="max" name="Max Vibration (g)" stroke={C.brand} fill="url(#gMax)" strokeWidth={2} isAnimationActive={false} />
+                     <Area type="step" dataKey="rms" name="RMS Vibration (g)" stroke={C.cyan} fill="url(#gRms)" strokeWidth={2} isAnimationActive={false} />
+                   </AreaChart>
+                 </ResponsiveContainer>
+               </div>
              </div>
+
+             {/* Restored Dataset Stats Row */}
+             {datasetStats && (
+               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                 <div className="p-4 rounded-2xl border" style={{ background: C.card, borderColor: C.border }}>
+                    <p className="text-[10px] text-slate-400 font-mono tracking-widest max-w-[100px] truncate">TRAINING SAMPLES</p>
+                    <p className="text-xl font-bold font-mono mt-1 text-slate-200">{datasetStats.total_samples?.toLocaleString()}</p>
+                 </div>
+                 <div className="p-4 rounded-2xl border" style={{ background: C.card, borderColor: C.border }}>
+                    <p className="text-[10px] text-slate-400 font-mono tracking-widest max-w-[100px] truncate">ANOMALIES DET.</p>
+                    <p className="text-xl font-bold font-mono mt-1 text-rose-400">{datasetStats.anomaly_count?.toLocaleString()}</p>
+                 </div>
+                 <div className="p-4 rounded-2xl border" style={{ background: C.card, borderColor: C.border }}>
+                    <p className="text-[10px] text-slate-400 font-mono tracking-widest max-w-[100px] truncate">MAX VIB (g)</p>
+                    <p className="text-xl font-bold font-mono mt-1 text-slate-200">{datasetStats.max_vibration?.max?.toFixed(2)}</p>
+                 </div>
+                 <div className="p-4 rounded-2xl border" style={{ background: C.card, borderColor: C.border }}>
+                    <p className="text-[10px] text-slate-400 font-mono tracking-widest max-w-[100px] truncate">RMS MEAN (g)</p>
+                    <p className="text-xl font-bold font-mono mt-1 text-slate-200">{datasetStats.rms_vibration?.mean?.toFixed(4)}</p>
+                 </div>
+               </div>
+             )}
           </div>
         </div>
 
         {/* PCA & ADVANCED METRICS */}
-        <div className="grid grid-cols-12 gap-4">
+        <div className="grid grid-cols-12 gap-4 pb-8">
           
           {/* PCA Scatter */}
           <div className="col-span-12 lg:col-span-4 p-5 rounded-[20px] border flex flex-col" style={{ background: C.card, borderColor: C.border }}>
