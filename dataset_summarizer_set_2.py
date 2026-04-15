@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 # Point this strictly to the folder for Test Run 2
-RAW_DATA_DIR = "C:\\BIPIN\\CODES\\Aegis\\datasets\\IMS\\2nd_test" 
+RAW_DATA_DIR = "C:\BIPIN\CODES\Aegis\datasets_ziped\IMS\4th_test" 
 OUTPUT_FILE = "nasa_test2_features.csv"
 
 def extract_features(file_path):

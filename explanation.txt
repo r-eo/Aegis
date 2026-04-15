@@ -1,0 +1,710 @@
+================================================================================
+               PROJECT AEGIS — COMPLETE TECHNICAL EXPLANATION
+             Predictive Maintenance Platform using Isolation Forest
+================================================================================
+Last Updated : April 15, 2026
+Version      : 1.0
+Author       : Project Aegis Team (r-eo)
+Repository   : https://github.com/r-eo/Aegis
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. PROJECT OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+Project Aegis is a real-time predictive maintenance platform for industrial
+machinery. It uses a smartphone's built-in accelerometer sensor to stream
+vibration data to a cloud backend, which runs an unsupervised machine learning
+algorithm (Isolation Forest) to detect anomalies and predict potential machine
+failures before they happen.
+
+The system has two deployable components:
+
+  1. BACKEND (Core Engine)  → Hosted on Render (Python / FastAPI)
+  2. FRONTEND (Command Center) → Hosted on Vercel (React / Vite)
+
+A smartphone opens the Vercel URL, grants accelerometer permission, and starts
+streaming vibration data at 20 Hz over a WebSocket to the Render backend. The
+backend processes the data, runs the ML model, and broadcasts anomaly scores
+back to all connected dashboard clients in real time.
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. REPOSITORY STRUCTURE
+────────────────────────────────────────────────────────────────────────────────
+
+Aegis/
+├── core_engine/                  ← Python FastAPI backend
+│   ├── main.py                   ← FastAPI app, WebSocket, REST endpoints
+│   ├── ml_pipeline.py            ← IsolationForest + PCA training & inference
+│   ├── telemetry_processor.py    ← Rolling window + feature extraction
+│   ├── models.py                 ← Pydantic data models
+│   ├── simulate_telemetry.py     ← Test script to simulate sensor data
+│   ├── trained_model.joblib      ← Saved IsolationForest (generated at startup)
+│   ├── scaler.joblib             ← Saved StandardScaler (generated at startup)
+│   └── pca_model.joblib          ← Saved PCA model (generated at startup)
+│
+├── datasets/
+│   ├── cwru_unsupervised_features.csv   ← Case Western Reserve University data
+│   └── nasa_test2_features.csv          ← NASA IMS Bearing dataset
+│
+├── command_center/               ← React frontend (Vite + Tailwind CSS v4)
+│   ├── src/
+│   │   ├── App.jsx               ← Root component
+│   │   ├── components/
+│   │   │   └── Dashboard.jsx     ← Main dashboard UI
+│   │   ├── hooks/
+│   │   │   ├── useMetricsSocket.js    ← Receives WS data (dashboard viewer)
+│   │   │   └── useAccelerometer.js   ← Sends phone sensor data via WS
+│   │   ├── store/
+│   │   │   └── useStore.js       ← Zustand global state store
+│   │   └── index.css             ← Tailwind v4 imports + base styles
+│   ├── vercel.json               ← Vercel deployment config (Vite SPA)
+│   ├── tailwind.config.js        ← Custom color tokens (brutal theme)
+│   ├── postcss.config.js         ← @tailwindcss/postcss (v4 compatible)
+│   └── .env                      ← Local env vars (gitignored)
+│
+├── requirements.txt              ← Python dependencies
+├── Procfile                      ← Render start command
+├── runtime.txt                   ← Python 3.11 pin for Render
+├── .gitignore
+└── md_files/
+    ├── plan.md                   ← Original 6-phase implementation plan
+    └── project_aegis_context.md  ← Project context document
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. DATASETS
+────────────────────────────────────────────────────────────────────────────────
+
+Two real-world bearing failure datasets are used to pre-train the model.
+
+─── 3.1 CWRU Dataset (Case Western Reserve University) ─────────────────────────
+
+File    : datasets/cwru_unsupervised_features.csv
+Rows    : 2,301
+Source  : CWRU Bearing Data Center (most widely used bearing fault dataset)
+
+Description:
+  The CWRU dataset contains accelerometer readings from drive-end and fan-end
+  bearings under different fault conditions (normal, ball fault, inner race
+  fault, outer race fault) at various motor loads (0–3 HP).
+
+Columns (pre-extracted statistical features per 2-second window):
+  - max       : Maximum acceleration value in the window
+  - min       : Minimum acceleration value in the window
+  - mean      : Mean (DC offset) of the signal
+  - sd        : Standard deviation of the signal
+  - rms       : Root Mean Square of the signal
+  - skewness  : Statistical skewness (asymmetry measure)
+  - kurtosis  : Statistical kurtosis (tail/impulsiveness measure)
+  - crest     : Crest factor (peak / RMS ratio — key fault indicator)
+  - form      : Form factor (RMS / mean_abs — shape descriptor)
+
+Features used for ML training from CWRU:
+  - max  → renamed to max_vibration
+  - rms  → renamed to rms_vibration
+
+The CWRU dataset contains a natural mix of healthy and faulty bearing data,
+making it ideal for training an unsupervised anomaly detector.
+
+─── 3.2 NASA IMS Bearing Dataset ───────────────────────────────────────────────
+
+File    : datasets/nasa_test2_features.csv
+Rows    : 985
+Source  : NASA IMS (Intelligent Maintenance Systems) Bearing Dataset, Test 2
+
+Description:
+  The NASA dataset is a run-to-failure experiment. Bearings were run continuously
+  until failure. The test2 subset shows a clear degradation trajectory — starting
+  from healthy operation and progressing to failure over several days.
+
+Columns (pre-extracted):
+  - timestamp_id    : Date/time string (e.g. 2004.02.12.10.32.39)
+  - max_vibration   : Maximum acceleration in window (g)
+  - rms_vibration   : RMS acceleration in window (g)
+
+This dataset is especially valuable because it shows the temporal degradation
+pattern — RMS and MAX values slowly rise as the bearing approaches failure.
+The final ~280 rows show catastrophic vibration increase (failure region).
+
+─── 3.3 Combined Training Set ───────────────────────────────────────────────────
+
+Total samples : 3,286 (2,301 CWRU + 985 NASA)
+Features used : max_vibration, rms_vibration
+Scaling       : StandardScaler (zero mean, unit variance) applied before training
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. MACHINE LEARNING MODEL — ISOLATION FOREST
+────────────────────────────────────────────────────────────────────────────────
+
+─── 4.1 Why Isolation Forest? ───────────────────────────────────────────────────
+
+Isolation Forest is an UNSUPERVISED anomaly detection algorithm. This is the
+correct choice for predictive maintenance because:
+
+  1. NO LABELS NEEDED: We don't need fault/no-fault labels. The model learns
+     what "normal" vibration looks like and flags anything different.
+
+  2. WORKS ON RAW FEATURES: It operates on simple numerical features (max, rms)
+     rather than raw time series.
+
+  3. EFFICIENT: O(n log n) training time, O(log n) inference. Fast enough for
+     real-time use at 20 Hz.
+
+  4. INTERPRETABLE: The anomaly score has clear meaning (0 = normal, 1 = fault).
+
+  5. ROBUST: Handles high-dimensional data without distributional assumptions.
+
+─── 4.2 Algorithm Explanation ───────────────────────────────────────────────────
+
+Isolation Forest works by randomly partitioning data:
+
+  1. Build many decision trees (n_estimators=200) where each tree randomly
+     selects a feature and a random split value between min and max.
+
+  2. Normal points require MANY splits to isolate (they cluster together).
+     Anomalies require FEW splits to isolate (they are sparse/extreme).
+
+  3. The anomaly score is based on the average path length to isolate a point
+     across all trees. Shorter path → more anomalous.
+
+  4. score_samples() returns a raw score near 0 for normal, negative for anomalies.
+
+─── 4.3 Model Hyperparameters ───────────────────────────────────────────────────
+
+  n_estimators    = 200       (number of isolation trees — more = stabler estimates)
+  contamination   = 0.05      (expected fraction of anomalies = 5%)
+  max_samples     = "auto"    (uses min(256, n_samples) samples per tree)
+  random_state    = 42        (for reproducibility)
+  n_jobs          = -1        (use all CPU cores for training)
+
+The contamination=0.05 means the model expects ~5% of training samples to be
+anomalous, which aligns with the known fault ratio in the CWRU dataset.
+
+─── 4.4 Score Normalization ─────────────────────────────────────────────────────
+
+Raw output from IsolationForest.score_samples() is in the range [-1.0, ~0.0].
+
+We map this to a clean [0.0, 1.0] anomaly score using:
+
+  1. Clip raw score to [-1.0, 0.1]
+  2. Normalize: anomaly_score = (raw_score - 0.1) / (-1.0 - 0.1)
+  3. Clip result to [0.0, 1.0]
+
+This gives:
+  - raw ≈ 0.0   → anomaly_score ≈ 0.0  (perfectly normal)
+  - raw ≈ -0.5  → anomaly_score ≈ 0.5  (moderate anomaly)
+  - raw ≈ -1.0  → anomaly_score ≈ 1.0  (severe anomaly)
+
+─── 4.5 Alert Thresholds ────────────────────────────────────────────────────────
+
+  anomaly_score > 0.7  → CRITICAL  (immediate alert, red UI)
+  anomaly_score > 0.4  → WARNING   (caution, yellow UI)
+  anomaly_score ≤ 0.4  → HEALTHY   (normal operation, green UI)
+
+These thresholds are based on the distribution of the training data and can be
+tuned in core_engine/main.py.
+
+─── 4.6 Model Persistence ────────────────────────────────────────────────────────
+
+The trained model is saved to disk on first startup using joblib:
+
+  core_engine/trained_model.joblib   ← IsolationForest model
+  core_engine/scaler.joblib          ← StandardScaler (fit on training data)
+  core_engine/pca_model.joblib       ← PCA model (2 components)
+
+On subsequent startups, the saved models are loaded (fast). The .joblib files
+are gitignored so they are regenerated fresh on every Render deployment.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. PRINCIPAL COMPONENT ANALYSIS (PCA)
+────────────────────────────────────────────────────────────────────────────────
+
+─── 5.1 Purpose ─────────────────────────────────────────────────────────────────
+
+PCA is used here for VISUALIZATION, not for anomaly detection. Since we only
+have 2 features (max_vibration, rms_vibration), PCA mostly shows the variance
+structure of the data, but if more features were added (e.g. all 9 CWRU columns),
+PCA would reduce them to 2D for the scatter plot.
+
+─── 5.2 Configuration ───────────────────────────────────────────────────────────
+
+  n_components = 2
+  Applied AFTER StandardScaler (so features are on equal scale)
+
+─── 5.3 Dashboard Visualization ─────────────────────────────────────────────────
+
+The PCA scatter plot in the dashboard shows:
+  - Green dots  : CWRU normal samples
+  - Red dots    : CWRU anomaly samples (flagged by IsolationForest)
+  - Purple dots : NASA normal samples
+  - Orange dots : NASA anomaly samples
+  - White star  : LIVE point (current incoming telemetry projected into PCA space)
+
+─── 5.4 REST Endpoint ────────────────────────────────────────────────────────────
+
+GET /api/pca-analytics
+
+Returns:
+  {
+    "points": [{"pc1": ..., "pc2": ..., "anomaly_score": ..., "is_anomaly": ..., "source": "cwru|nasa"}, ...],
+    "explained_variance": [0.xx, 0.xx],
+    "total_samples": 3286,
+    "anomaly_count": 164
+  }
+
+Max 500 points are returned (random sample) for dashboard performance.
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. TELEMETRY PROCESSING PIPELINE
+────────────────────────────────────────────────────────────────────────────────
+
+─── 6.1 Signal Flow ─────────────────────────────────────────────────────────────
+
+Phone accelerometer
+  ↓ raw X, Y, Z acceleration values (m/s² or g, depending on device)
+Vector Magnitude = sqrt(X² + Y² + Z²)
+  ↓ scalar magnitude per sample
+Rolling Window Buffer (deque, maxlen=40 samples = 2 seconds at 20 Hz)
+  ↓ last 40 magnitudes
+Feature Extraction:
+  max_vibration = max(buffer)
+  rms_vibration = sqrt(mean(buffer²))
+  ↓ 2 features
+StandardScaler.transform([[max_vib, rms_vib]])
+  ↓ scaled features
+IsolationForest.score_samples()
+  ↓ raw anomaly score
+Normalization → [0.0, 1.0] anomaly score
+  ↓
+Alert classification (HEALTHY / WARNING / CRITICAL)
+  ↓
+Broadcast to all connected WebSocket clients
+
+─── 6.2 TelemetryProcessor Class ────────────────────────────────────────────────
+
+File: core_engine/telemetry_processor.py
+
+  - Uses collections.deque(maxlen=40) as a circular buffer
+  - Window size: 40 samples
+  - At 20 Hz sampling rate: 40 / 20 = 2 second window
+  - Vector magnitude computed per incoming sample
+  - Feature extraction only possible when buffer has ≥ 1 sample
+
+─── 6.3 Sampling Rate ────────────────────────────────────────────────────────────
+
+The frontend sends data every 50ms (SEND_INTERVAL_MS = 50), which gives 20 Hz.
+This is the standard rate for vibration analysis in industrial applications.
+The buffer fills in 2 seconds (40 samples × 50ms).
+
+
+────────────────────────────────────────────────────────────────────────────────
+7. BACKEND API (FastAPI)
+────────────────────────────────────────────────────────────────────────────────
+
+─── 7.1 Startup (Lifespan) ──────────────────────────────────────────────────────
+
+On server startup (using FastAPI's lifespan context manager):
+  1. TelemetryProcessor is initialized (window_size=40)
+  2. MLPipeline is initialized:
+     a. Tries to load saved .joblib models from disk
+     b. If not found, loads both CSVs from datasets/ folder
+     c. Scales data with StandardScaler
+     d. Trains IsolationForest (200 trees, contamination=0.05)
+     e. Fits PCA (2 components)
+     f. Saves models to .joblib files
+  3. Server is ready to accept connections
+
+─── 7.2 WebSocket Endpoint ──────────────────────────────────────────────────────
+
+Path    : /ws/telemetry
+Protocol: WebSocket (WSS in production)
+
+Incoming message format (JSON string):
+  {
+    "vib_x": 0.123,
+    "vib_y": -0.456,
+    "vib_z": 9.81,
+    "timestamp": 1713198210.5
+  }
+
+Outgoing broadcast format (JSON, sent to ALL connected clients):
+  {
+    "timestamp": 1713198210.5,
+    "anomaly_score": 0.142,
+    "max_vibration": 0.523,
+    "rms_vibration": 0.124,
+    "alert_status": "HEALTHY",
+    "pca": {
+      "pc1": -1.23,
+      "pc2": 0.45
+    }
+  }
+
+During buffer fill phase (first 2 seconds):
+  { "status": "buffering", "buffer_size": 12, "timestamp": ... }
+
+─── 7.3 REST Endpoints ──────────────────────────────────────────────────────────
+
+GET  /                    → Health check (service name, version)
+GET  /health              → Detailed health (model_ready, ws_connections, timestamp)
+GET  /api/model-info      → Model metadata (type, params, training stats)
+GET  /api/pca-analytics   → PCA scatter plot data (max 500 sampled points)
+GET  /api/dataset-stats   → Training data statistics (min/max/mean/std)
+POST /api/score           → Score a single reading (REST, no WebSocket needed)
+
+─── 7.4 Connection Manager ──────────────────────────────────────────────────────
+
+The ConnectionManager class tracks all active WebSocket connections in a list.
+When a new anomaly score is computed, it is BROADCAST to ALL connections.
+
+This means:
+  - The phone sends data → backend processes → result goes to phone + dashboard
+  - Multiple dashboard viewers can connect simultaneously
+  - Dead connections are automatically cleaned up on send failure
+
+─── 7.5 CORS Configuration ──────────────────────────────────────────────────────
+
+  allow_origins=["*"]     → All origins allowed (fine for MVP, tighten in prod)
+  allow_credentials=True
+  allow_methods=["*"]
+  allow_headers=["*"]
+
+
+────────────────────────────────────────────────────────────────────────────────
+8. FRONTEND (React + Vite)
+────────────────────────────────────────────────────────────────────────────────
+
+─── 8.1 Tech Stack ──────────────────────────────────────────────────────────────
+
+  React 19          → UI framework
+  Vite 8            → Build tool and dev server
+  Tailwind CSS v4   → Utility-first styling
+  Recharts 3        → Chart library (LineChart, AreaChart, ScatterChart)
+  Zustand 5         → Global state management
+  @tailwindcss/postcss → PostCSS integration for Tailwind v4
+
+─── 8.2 Tailwind v4 Notes ───────────────────────────────────────────────────────
+
+This project uses Tailwind CSS v4, which introduced breaking changes from v3:
+
+  OLD (v3):                          NEW (v4):
+  @tailwind base;               →    @import "tailwindcss";
+  @tailwind components;         →    @config "../tailwind.config.js";
+  @tailwind utilities;
+
+  postcss.config.js:
+  OLD: { tailwindcss: {} }      →    NEW: { '@tailwindcss/postcss': {} }
+
+  The @tailwindcss/postcss package must be installed separately:
+  npm install -D @tailwindcss/postcss
+
+─── 8.3 Custom Color Tokens (tailwind.config.js) ────────────────────────────────
+
+  brutal-dark     : #0f0f11  (page background)
+  brutal-panel    : #1A1A1D  (card backgrounds)
+  brutal-border   : #333333  (card borders)
+  brutal-green    : #22c55e  (healthy state, success)
+  brutal-warning  : #eab308  (warning state)
+  brutal-critical : #ef4444  (critical/fault state)
+  brutal-text     : #eaeaea  (primary text)
+  brutal-muted    : #888888  (secondary/label text)
+
+─── 8.4 Dashboard Components ────────────────────────────────────────────────────
+
+ConnectionPill:
+  Shows LIVE (green) / CONNECTING (yellow) / OFFLINE (red) WebSocket status.
+
+Alert Banner:
+  Full-width panel showing HEALTHY / WARNING / CRITICAL.
+  Color transitions smoothly (CSS transition-colors duration-700).
+  In CRITICAL state, the text animates with animate-pulse.
+  Shows anomaly score as a large percentage on the right.
+
+Accelerometer Panel:
+  Shows current permission state and streaming status.
+  "Start Monitoring" button triggers DeviceMotionEvent.requestPermission()
+  (iOS 13+ requirement) or auto-starts on Android.
+  Streams at 20 Hz via a separate WebSocket connection.
+
+MetricCard x4:
+  - Anomaly Score (0.000 – 1.000)
+  - Peak Vibration (g)
+  - RMS Vibration (g)
+  - Live PCA (PC1, PC2 coordinates)
+
+Real-Time Vibration Chart (AreaChart):
+  - Shows last 100 readings
+  - Two area series: RMS (color matches alert state) and MAX (purple)
+  - isAnimationActive=false for smooth live streaming
+  - Legend, CartesianGrid, custom gradient fills
+
+Anomaly Score Chart (AreaChart):
+  - Orange area line from 0.0 to 1.0
+  - Orange gradient fill
+  - ReferenceLine at 0.4 (WARNING, yellow dashed)
+  - ReferenceLine at 0.7 (CRITICAL, red dashed)
+
+PCA Scatter Plot (ScatterChart):
+  - Shows training dataset clusters
+  - 4 scatter series: CWRU normal, CWRU anomaly, NASA normal, NASA anomaly
+  - Live point overlaid as white dot (current inference position)
+  - Custom PcaTooltip showing source, coordinates, score, anomaly status
+  - Explained variance ratio shown in top-right (e.g. "PC1 72.3% · PC2 27.7%")
+
+Dataset Stats Cards x4:
+  - Total training samples
+  - Anomaly count + rate percentage
+  - Max vibration range (min – max)
+  - RMS vibration mean ± std
+
+Model Info Footer:
+  Single row of monospace text showing:
+  MODEL · ESTIMATORS · CONTAMINATION · PCA COMPONENTS · TRAINING SIZE · VAR EXPLAINED
+
+─── 8.5 State Management (Zustand) ──────────────────────────────────────────────
+
+Store fields:
+  telemetryData      : array (last 100 points for charts)
+  currentScore       : number (latest anomaly score)
+  currentMax         : number (latest max vibration)
+  currentRms         : number (latest RMS vibration)
+  alertStatus        : string (HEALTHY | WARNING | CRITICAL)
+  connectionStatus   : string (connected | connecting | disconnected)
+  currentPca         : { pc1, pc2 } (latest PCA projection of live point)
+  pcaAnalytics       : object (PCA scatter data from REST API)
+  datasetStats       : object (training data stats from REST API)
+  modelInfo          : object (model metadata from REST API)
+
+Actions:
+  setConnectionStatus(status)
+  addTelemetry(data)       → appends to telemetryData, shifts if > 100 items
+  setPcaAnalytics(data)
+  setDatasetStats(data)
+  setModelInfo(data)
+
+─── 8.6 useAccelerometer Hook ───────────────────────────────────────────────────
+
+File: src/hooks/useAccelerometer.js
+
+  States:
+    permission   : 'unknown' | 'granted' | 'denied' | 'unavailable'
+    isStreaming  : boolean
+
+  How it works:
+    1. requestPermission() is called on button click (MUST be user gesture on iOS)
+    2. If DeviceMotionEvent.requestPermission is a function (iOS 13+):
+       → calls it, awaits result ('granted' or 'denied')
+    3. If not (Android / Desktop):
+       → auto-grants and proceeds
+    4. On grant: opens a WebSocket, attaches devicemotion event listener
+    5. setInterval (50ms = 20 Hz) sends { vib_x, vib_y, vib_z, timestamp }
+    6. Uses accelerationIncludingGravity for raw sensor values
+
+  Note: Works ONLY on HTTPS origins. Both Vercel and Render provide HTTPS.
+
+
+────────────────────────────────────────────────────────────────────────────────
+9. DEPLOYMENT ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+─── 9.1 Backend → Render ────────────────────────────────────────────────────────
+
+Platform     : Render (https://render.com)
+Service Type : Web Service
+Runtime      : Python 3.11 (runtime.txt)
+Root Dir     : / (repo root)
+Build Command: pip install -r requirements.txt
+Start Command: uvicorn core_engine.main:app --host 0.0.0.0 --port $PORT
+
+Files:
+  Procfile    → web: uvicorn core_engine.main:app --host 0.0.0.0 --port $PORT
+  runtime.txt → 3.11
+
+On first deploy, Render:
+  1. Installs Python dependencies
+  2. Starts uvicorn
+  3. FastAPI lifespan runs ML training
+  4. Server ready (typically 60–120 seconds on cold start due to training)
+
+NOTE: Render free tier spins down after 15 minutes of inactivity.
+On wake, the model is retrained from CSVs (~30–60 seconds).
+
+─── 9.2 Frontend → Vercel ───────────────────────────────────────────────────────
+
+Platform      : Vercel (https://vercel.com)
+Framework     : Vite
+Root Directory: command_center/ (set in Vercel project settings)
+Build Command : npm run build
+Output Dir    : dist
+
+vercel.json config:
+  {
+    "framework": "vite",
+    "buildCommand": "npm run build",
+    "installCommand": "npm install && npm install @tailwindcss/postcss -D",
+    "outputDirectory": "dist",
+    "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+  }
+
+The installCommand is modified to also install @tailwindcss/postcss (required
+for Tailwind v4 compatibility with PostCSS).
+
+─── 9.3 Environment Variables ───────────────────────────────────────────────────
+
+Set on Vercel dashboard (Settings → Environment Variables):
+
+  VITE_WS_URL   = wss://your-app.onrender.com/ws/telemetry
+  VITE_API_BASE = https://your-app.onrender.com
+
+These are VITE_ prefixed so Vite bundles them into the client-side JS at
+build time. They cannot be changed at runtime — a redeploy is needed.
+
+Local development (.env — gitignored):
+  VITE_WS_URL=ws://localhost:8000/ws/telemetry
+  VITE_API_BASE=http://localhost:8000
+
+─── 9.4 Data Flow Diagram ───────────────────────────────────────────────────────
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                         PHONE                               │
+  │  Opens Vercel URL → clicks "Start Monitoring"               │
+  │  DeviceMotionEvent granted → reads accelerometer at 20 Hz   │
+  │  Sends { vib_x, vib_y, vib_z } via WSS to Render           │
+  └────────────────────────┬────────────────────────────────────┘
+                           │ WSS (WebSocket Secure)
+                           ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                   RENDER (Backend)                          │
+  │  Receives vib_x, vib_y, vib_z                               │
+  │  → Vector magnitude = sqrt(x²+y²+z²)                       │
+  │  → Rolling buffer (40 samples, 2 seconds)                   │
+  │  → Extract max_vibration, rms_vibration                     │
+  │  → StandardScaler.transform()                               │
+  │  → IsolationForest.score_samples()                          │
+  │  → Normalize score to [0.0, 1.0]                            │
+  │  → PCA.transform() for scatter coordinates                  │
+  │  → Classify HEALTHY / WARNING / CRITICAL                    │
+  │  → Broadcast JSON to ALL connected WebSocket clients         │
+  └────────────────────────┬────────────────────────────────────┘
+                           │ WSS Broadcast
+                           ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │               DASHBOARD (any device, Vercel URL)            │
+  │  Receives anomaly_score, max_vibration, rms_vibration,      │
+  │  alert_status, pca coords                                   │
+  │  → Updates Zustand store                                    │
+  │  → Re-renders alert banner, metric cards, charts            │
+  │  → Updates live PCA point on scatter plot                   │
+  └─────────────────────────────────────────────────────────────┘
+
+
+────────────────────────────────────────────────────────────────────────────────
+10. GIT / GITHUB HISTORY
+────────────────────────────────────────────────────────────────────────────────
+
+Repository: https://github.com/r-eo/Aegis
+Branch    : main
+
+Key commits:
+  91c23f1  first commit (README.md, initial files)
+  a92188b  fix: update tailwind postcss config for verification
+  [later]  fix(styles): upgrade tailwind css imports for v4 compatibility
+  069f03d  feat: full backend ML pipeline + PCA dashboard + accelerometer streaming
+
+Issues encountered and fixed:
+  1. Remote origin pointed to wrong repo (Advaya-2K26/TEAM-API)
+     Fixed: git remote set-url origin https://github.com/r-eo/Aegis
+
+  2. Vercel build failing: "Cannot apply unknown utility class bg-brutal-dark"
+     Root cause: Tailwind v4 changed how PostCSS plugin is referenced
+     Fix 1: postcss.config.js → '@tailwindcss/postcss' instead of 'tailwindcss'
+     Fix 2: installCommand in vercel.json → includes @tailwindcss/postcss
+     Fix 3: index.css → @import "tailwindcss" + @config (v4 syntax)
+
+  3. Frontend connecting to localhost instead of Render
+     Root cause: .env is gitignored, Vercel env vars not set
+     Fix: Set VITE_WS_URL and VITE_API_BASE in Vercel dashboard, redeploy
+
+
+────────────────────────────────────────────────────────────────────────────────
+11. LOCAL DEVELOPMENT SETUP
+────────────────────────────────────────────────────────────────────────────────
+
+─── Backend ─────────────────────────────────────────────────────────────────────
+
+# In repo root (Aegis/)
+python -m venv venv
+venv\Scripts\activate          # Windows
+pip install -r requirements.txt
+uvicorn core_engine.main:app --reload --port 8000
+
+The --reload flag auto-restarts on code changes.
+API docs available at: http://localhost:8000/docs
+
+─── Frontend ────────────────────────────────────────────────────────────────────
+
+# In command_center/
+npm install
+npm install -D @tailwindcss/postcss    # Only needed on first setup
+npm run dev                            # Starts on http://localhost:5173
+
+─── Test WebSocket (without phone) ──────────────────────────────────────────────
+
+# With both backend running, run the simulator:
+python core_engine/simulate_telemetry.py
+
+This sends synthetic vibration data to ws://localhost:8000/ws/telemetry
+so you can see the dashboard update without a physical phone.
+
+
+────────────────────────────────────────────────────────────────────────────────
+12. PYTHON DEPENDENCIES
+────────────────────────────────────────────────────────────────────────────────
+
+  fastapi            → Web framework + WebSocket server
+  uvicorn[standard]  → ASGI server (with websockets support)
+  numpy              → Numerical computing (vector magnitude, RMS)
+  scikit-learn       → IsolationForest, PCA, StandardScaler
+  pandas             → Dataset loading and manipulation
+  joblib             → Model serialization (save/load .joblib files)
+  websockets         → WebSocket protocol support
+  python-multipart   → Required by FastAPI for form data
+
+
+────────────────────────────────────────────────────────────────────────────────
+13. FUTURE IMPROVEMENTS (from plan.md Phase 3–6)
+────────────────────────────────────────────────────────────────────────────────
+
+  Phase 3: PWA (Progressive Web App)
+    - manifest.json for "Add to Home Screen"
+    - Service worker for offline caching
+    - Haptic feedback (Vibration API) on CRITICAL alerts
+    - Screen wake lock (keep screen on while monitoring)
+
+  Phase 4: Production Hardening
+    - Restrict CORS to specific Vercel domain
+    - WebSocket authentication (JWT token)
+    - Persistent historical data storage (PostgreSQL or TimescaleDB)
+    - Sentry error tracking
+
+  Phase 5: ML Improvements
+    - Use all 9 CWRU features (add skewness, kurtosis, crest factor, etc.)
+    - Periodic online retraining as new data accumulates
+    - Confidence intervals on anomaly scores
+    - Multiple machine support (multi-sensor dashboard)
+
+  Phase 6: Scalability
+    - Horizontal scaling with Redis pub/sub for WebSocket broadcasting
+    - Load balancer for multiple backend instances
+    - CDN for static assets
+
+
+────────────────────────────────────────────────────────────────────────────────
+END OF DOCUMENT
+================================================================================

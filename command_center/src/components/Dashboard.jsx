@@ -1,11 +1,10 @@
-import React, { useEffect, useCallback, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer,
   Tooltip, ScatterChart, Scatter, ZAxis, ReferenceLine,
   AreaChart, Area, Legend
 } from 'recharts';
 import { useStore } from '../store/useStore';
-import { useAccelerometer } from '../hooks/useAccelerometer';
 
 // ─── env ───────────────────────────────────────────────────────────────────
 const WS_URL    = import.meta.env.VITE_WS_URL    || 'ws://localhost:8000/ws/telemetry';
@@ -102,10 +101,6 @@ export const Dashboard = () => {
     return () => { clearTimeout(retryTimer); wsRef.current?.close(); };
   }, [addTelemetry, setConnectionStatus]);
 
-  // ── Accelerometer sender hook ──────────────────────────────────────────
-  const { permission, isStreaming, requestPermission, stopStreaming } =
-    useAccelerometer(WS_URL);
-
   // ── Fetch analytics from REST API (once on mount) ──────────────────────
   useEffect(() => {
     const fetchAnalytics = async () => {
@@ -177,40 +172,6 @@ export const Dashboard = () => {
           <div className="text-4xl font-mono font-black">{(currentScore * 100).toFixed(1)}<span className="text-2xl opacity-60">%</span></div>
           <p className="text-sm opacity-70 font-mono">ANOMALY SCORE</p>
         </div>
-      </div>
-
-      {/* ── Accelerometer Sender Button ── */}
-      <div className="bg-brutal-panel border border-brutal-border rounded-2xl p-4 flex flex-col sm:flex-row items-center justify-between gap-3">
-        <div>
-          <p className="text-sm font-semibold">📱 Phone Accelerometer</p>
-          <p className="text-brutal-muted text-xs mt-0.5 font-mono">
-            {permission === 'unavailable'
-              ? 'DeviceMotionEvent not available in this browser.'
-              : permission === 'denied'
-              ? '⚠ Permission denied. Check browser settings.'
-              : isStreaming
-              ? '✅ Streaming accelerometer data at 20 Hz…'
-              : 'Open this page on your phone to stream live sensor data.'}
-          </p>
-        </div>
-        {!isStreaming ? (
-          <button
-            id="btn-start-accelerometer"
-            onClick={requestPermission}
-            disabled={permission === 'unavailable' || permission === 'denied'}
-            className="px-5 py-2 rounded-xl font-semibold text-sm bg-emerald-500 text-black hover:bg-emerald-400 transition disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
-          >
-            Start Monitoring
-          </button>
-        ) : (
-          <button
-            id="btn-stop-accelerometer"
-            onClick={stopStreaming}
-            className="px-5 py-2 rounded-xl font-semibold text-sm bg-red-500 text-white hover:bg-red-400 transition whitespace-nowrap"
-          >
-            Stop Streaming
-          </button>
-        )}
       </div>
 
       {/* ── Primary Metrics ── */}
@@ -334,7 +295,7 @@ export const Dashboard = () => {
           <MetricCard
             title="Training Samples"
             value={datasetStats.total_samples?.toLocaleString()}
-            sub="CWRU + NASA"
+            sub={datasetStats.train_dataset || 'nasa_test4_features'}
           />
           <MetricCard
             title="Anomalies Found"

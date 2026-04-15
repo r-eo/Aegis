@@ -45,7 +45,10 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Project Aegis Core Engine",
-    description="Predictive maintenance platform — real-time anomaly detection via IsolationForest",
+    description=(
+        "Predictive maintenance platform — real-time anomaly detection via IsolationForest. "
+        "Trained on nasa_test4_features; streamed via nasa_test2_features simulation."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -131,13 +134,15 @@ async def pca_analytics():
 
 @app.get("/api/dataset-stats", tags=["Analytics"])
 async def dataset_stats():
-    """Return key statistics about the training data."""
+    """Return key statistics about the training data (nasa_test4_features)."""
     if not ml_pipeline or ml_pipeline.training_data_cache is None:
         raise HTTPException(status_code=503, detail="Training data not available")
 
     df = ml_pipeline.training_data_cache
     stats = {
         "total_samples": len(df),
+        "train_dataset": "nasa_test4_features (4 bearings)",
+        "test_dataset": "nasa_test2_features (simulation stream)",
         "anomaly_count": int(df["is_anomaly"].sum()),
         "normal_count": int((~df["is_anomaly"]).sum()),
         "anomaly_rate": round(float(df["is_anomaly"].mean()), 4),
@@ -193,10 +198,23 @@ async def score_single(payload: dict):
 @app.websocket("/ws/telemetry")
 async def telemetry_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time accelerometer telemetry.
+    WebSocket endpoint for real-time vibration telemetry.
 
-    Incoming JSON:
+    Accepts two payload formats:
+
+    Format A — Pre-computed features (from nasa_test2 simulator):
+        {
+            "timestamp": 1234567890.0,
+            "max_vibration": 0.45,
+            "rms_vibration": 0.078,
+            "vib_x": ..., "vib_y": ..., "vib_z": ...   # optional / ignored
+        }
+        When max_vibration and rms_vibration are present, they are used directly
+        (no rolling-window processing needed).
+
+    Format B — Raw tri-axis acceleration:
         { "vib_x": 0.1, "vib_y": -0.2, "vib_z": 0.9, "timestamp": 1234567890.0 }
+        Features are extracted via the rolling TelemetryProcessor window.
 
     Broadcast JSON (to all connected clients):
         {
@@ -207,13 +225,10 @@ async def telemetry_endpoint(websocket: WebSocket):
             "alert_status": "HEALTHY|WARNING|CRITICAL",
             "pca": { "pc1": ..., "pc2": ... }
         }
-
-    Accelerometer permission note:
-        The browser requires HTTPS + user gesture to grant DeviceMotion access.
-        On iOS 13+ the frontend must call DeviceMotionEvent.requestPermission().
-        The backend just receives the already-granted data — no special handling needed here.
     """
     await manager.connect(websocket)
+    telemetry_processor.reset()   # flush any stale buffer from previous session
+    logger.info("Buffer reset for new WebSocket connection.")
     try:
         while True:
             raw = await websocket.receive_text()
@@ -224,28 +239,34 @@ async def telemetry_endpoint(websocket: WebSocket):
                 continue
 
             ts = payload.get("timestamp", time.time())
-            vib_x = float(payload.get("vib_x", 0.0))
-            vib_y = float(payload.get("vib_y", 0.0))
-            vib_z = float(payload.get("vib_z", 0.0))
 
-            # Feature extraction
-            telemetry_processor.add_data(vib_x, vib_y, vib_z)
-            max_vib, rms_vib = telemetry_processor.extract_features()
+            # ── Format A: pre-computed features from the CSV simulator ────────
+            if "max_vibration" in payload and "rms_vibration" in payload:
+                max_vib = float(payload["max_vibration"])
+                rms_vib = float(payload["rms_vibration"])
 
-            if max_vib is None or rms_vib is None:
-                # Buffer still filling — echo a status message
-                await websocket.send_json({
-                    "status": "buffering",
-                    "buffer_size": len(telemetry_processor.buffer),
-                    "timestamp": ts,
-                })
-                continue
+            # ── Format B: raw tri-axis acceleration (rolling window) ──────────
+            else:
+                vib_x = float(payload.get("vib_x", 0.0))
+                vib_y = float(payload.get("vib_y", 0.0))
+                vib_z = float(payload.get("vib_z", 0.0))
 
-            # ML inference
+                telemetry_processor.add_data(vib_x, vib_y, vib_z)
+                max_vib, rms_vib = telemetry_processor.extract_features()
+
+                if max_vib is None or rms_vib is None:
+                    await websocket.send_json({
+                        "status": "buffering",
+                        "buffer_size": len(telemetry_processor.buffer),
+                        "timestamp": ts,
+                    })
+                    continue
+
+            # ── ML inference ──────────────────────────────────────────────────
             anomaly_score = ml_pipeline.predict(max_vib, rms_vib)
-            pca_coords = ml_pipeline.predict_pca(max_vib, rms_vib)
+            pca_coords    = ml_pipeline.predict_pca(max_vib, rms_vib)
 
-            # Alert classification
+            # ── Alert classification ──────────────────────────────────────────
             alert_status = "HEALTHY"
             if anomaly_score > 0.7:
                 alert_status = "CRITICAL"
@@ -264,7 +285,7 @@ async def telemetry_endpoint(websocket: WebSocket):
                 },
             }
 
-            # Broadcast to all connected clients (dashboard + sender)
+            # Broadcast to all connected clients (dashboard viewers)
             await manager.broadcast_json(result)
 
     except WebSocketDisconnect:
