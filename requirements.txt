@@ -1,5 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 numpy
 scikit-learn
+pandas
+joblib
 websockets
+python-multipart

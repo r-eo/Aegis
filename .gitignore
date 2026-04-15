@@ -8,6 +8,9 @@ venv/
 __pycache__/
 *.pyc
 
+# Trained model artifacts (regenerated at startup on Render)
+core_engine/*.joblib
+
 # Node / Vite (Frontend)
 command_center/node_modules/
 command_center/dist/

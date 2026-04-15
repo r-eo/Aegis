@@ -1,83 +1,274 @@
 import json
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 import time
+import logging
+from contextlib import asynccontextmanager
+from typing import List
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .models import TelemetryPayload, AnomalyScoreResult
 from .telemetry_processor import TelemetryProcessor
 from .ml_pipeline import MLPipeline
 
-app = FastAPI(title="Project Aegis Core Engine")
+# ─────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────
+# Global singletons (created at startup)
+# ─────────────────────────────────────────────────────────────
+ml_pipeline: MLPipeline = None
+telemetry_processor: TelemetryProcessor = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Train the model at startup, clean up on shutdown."""
+    global ml_pipeline, telemetry_processor
+    logger.info("🚀 Project Aegis Core Engine starting up...")
+    telemetry_processor = TelemetryProcessor(window_size=40)
+    ml_pipeline = MLPipeline(contamination=0.05)
+    logger.info("✅ Startup complete — ready to accept connections.")
+    yield
+    logger.info("🛑 Shutting down...")
+
+
+# ─────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Project Aegis Core Engine",
+    description="Predictive maintenance platform — real-time anomaly detection via IsolationForest",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],          # Tightened in production via env var
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# ─────────────────────────────────────────────────────────────
+# WebSocket Connection Manager
+# ─────────────────────────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: List[WebSocket] = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        logger.info(f"Client connected. Total connections: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+        logger.info(f"Client disconnected. Total connections: {len(self.active_connections)}")
 
     async def broadcast_json(self, message: dict):
-        # Create list to avoid modification during iteration
+        dead = []
         for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
-            except WebSocketDisconnect:
-                self.disconnect(connection)
+            except Exception:
+                dead.append(connection)
+        for d in dead:
+            self.disconnect(d)
+
 
 manager = ConnectionManager()
-telemetry_processor = TelemetryProcessor(window_size=40)
-ml_pipeline = MLPipeline()
+
+
+# ─────────────────────────────────────────────────────────────
+# REST Endpoints
+# ─────────────────────────────────────────────────────────────
+
+@app.get("/", tags=["Health"])
+async def root():
+    return {"status": "ok", "service": "Project Aegis Core Engine", "version": "1.0.0"}
+
+
+@app.get("/health", tags=["Health"])
+async def health():
+    return {
+        "status": "healthy",
+        "model_ready": ml_pipeline.is_trained if ml_pipeline else False,
+        "active_websocket_connections": len(manager.active_connections),
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/api/model-info", tags=["Analytics"])
+async def model_info():
+    """Return metadata about the trained IsolationForest model."""
+    if not ml_pipeline:
+        raise HTTPException(status_code=503, detail="ML pipeline not initialized")
+    return JSONResponse(content=ml_pipeline.get_model_info())
+
+
+@app.get("/api/pca-analytics", tags=["Analytics"])
+async def pca_analytics():
+    """
+    Return PCA scatter data from training datasets.
+    Used by the Command Center dashboard to render PCA visualization.
+    """
+    if not ml_pipeline:
+        raise HTTPException(status_code=503, detail="ML pipeline not initialized")
+    data = ml_pipeline.get_pca_analytics()
+    return JSONResponse(content=data)
+
+
+@app.get("/api/dataset-stats", tags=["Analytics"])
+async def dataset_stats():
+    """Return key statistics about the training data."""
+    if not ml_pipeline or ml_pipeline.training_data_cache is None:
+        raise HTTPException(status_code=503, detail="Training data not available")
+
+    df = ml_pipeline.training_data_cache
+    stats = {
+        "total_samples": len(df),
+        "anomaly_count": int(df["is_anomaly"].sum()),
+        "normal_count": int((~df["is_anomaly"]).sum()),
+        "anomaly_rate": round(float(df["is_anomaly"].mean()), 4),
+        "max_vibration": {
+            "min": round(float(df["max_vibration"].min()), 4),
+            "max": round(float(df["max_vibration"].max()), 4),
+            "mean": round(float(df["max_vibration"].mean()), 4),
+            "std": round(float(df["max_vibration"].std()), 4),
+        },
+        "rms_vibration": {
+            "min": round(float(df["rms_vibration"].min()), 4),
+            "max": round(float(df["rms_vibration"].max()), 4),
+            "mean": round(float(df["rms_vibration"].mean()), 4),
+            "std": round(float(df["rms_vibration"].std()), 4),
+        },
+        "sources": df["source"].value_counts().to_dict(),
+    }
+    return JSONResponse(content=stats)
+
+
+@app.post("/api/score", tags=["Inference"])
+async def score_single(payload: dict):
+    """
+    REST endpoint to score a single telemetry reading.
+    Body: { "max_vibration": 0.5, "rms_vibration": 0.12 }
+    """
+    if not ml_pipeline:
+        raise HTTPException(status_code=503, detail="ML pipeline not initialized")
+    
+    max_vib = float(payload.get("max_vibration", 0.0))
+    rms_vib = float(payload.get("rms_vibration", 0.0))
+    score = ml_pipeline.predict(max_vib, rms_vib)
+    pca_coords = ml_pipeline.predict_pca(max_vib, rms_vib)
+    
+    alert = "HEALTHY"
+    if score > 0.7:
+        alert = "CRITICAL"
+    elif score > 0.4:
+        alert = "WARNING"
+
+    return {
+        "anomaly_score": round(score, 4),
+        "alert_status": alert,
+        "pca": pca_coords,
+        "timestamp": time.time(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# WebSocket — Real-time Telemetry
+# ─────────────────────────────────────────────────────────────
 
 @app.websocket("/ws/telemetry")
 async def telemetry_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time accelerometer telemetry.
+
+    Incoming JSON:
+        { "vib_x": 0.1, "vib_y": -0.2, "vib_z": 0.9, "timestamp": 1234567890.0 }
+
+    Broadcast JSON (to all connected clients):
+        {
+            "timestamp": ...,
+            "anomaly_score": 0.0–1.0,
+            "max_vibration": ...,
+            "rms_vibration": ...,
+            "alert_status": "HEALTHY|WARNING|CRITICAL",
+            "pca": { "pc1": ..., "pc2": ... }
+        }
+
+    Accelerometer permission note:
+        The browser requires HTTPS + user gesture to grant DeviceMotion access.
+        On iOS 13+ the frontend must call DeviceMotionEvent.requestPermission().
+        The backend just receives the already-granted data — no special handling needed here.
+    """
     await manager.connect(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
-            payload = json.loads(data)
-            
+            raw = await websocket.receive_text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"error": "Invalid JSON"})
+                continue
+
             ts = payload.get("timestamp", time.time())
-            
-            telemetry_processor.add_data(
-                vib_x=payload.get("vib_x", 0.0),
-                vib_y=payload.get("vib_y", 0.0),
-                vib_z=payload.get("vib_z", 0.0)
-            )
-            
+            vib_x = float(payload.get("vib_x", 0.0))
+            vib_y = float(payload.get("vib_y", 0.0))
+            vib_z = float(payload.get("vib_z", 0.0))
+
+            # Feature extraction
+            telemetry_processor.add_data(vib_x, vib_y, vib_z)
             max_vib, rms_vib = telemetry_processor.extract_features()
-            
-            if max_vib is not None and rms_vib is not None:
-                ml_pipeline.add_calibration_data(max_vib, rms_vib)
-                anomaly_score = ml_pipeline.predict(max_vib, rms_vib)
-                
-                alert_status = "HEALTHY"
-                if anomaly_score > 0.7:
-                    alert_status = "CRITICAL"
-                elif anomaly_score > 0.4:
-                    alert_status = "WARNING"
-                
-                result = AnomalyScoreResult(
-                    timestamp=ts,
-                    anomaly_score=anomaly_score,
-                    max_vibration=max_vib,
-                    rms_vibration=rms_vib,
-                    alert_status=alert_status
-                )
-                
-                await manager.broadcast_json(result.dict())
-                
+
+            if max_vib is None or rms_vib is None:
+                # Buffer still filling — echo a status message
+                await websocket.send_json({
+                    "status": "buffering",
+                    "buffer_size": len(telemetry_processor.buffer),
+                    "timestamp": ts,
+                })
+                continue
+
+            # ML inference
+            anomaly_score = ml_pipeline.predict(max_vib, rms_vib)
+            pca_coords = ml_pipeline.predict_pca(max_vib, rms_vib)
+
+            # Alert classification
+            alert_status = "HEALTHY"
+            if anomaly_score > 0.7:
+                alert_status = "CRITICAL"
+            elif anomaly_score > 0.4:
+                alert_status = "WARNING"
+
+            result = {
+                "timestamp": ts,
+                "anomaly_score": round(anomaly_score, 4),
+                "max_vibration": round(max_vib, 4),
+                "rms_vibration": round(rms_vib, 4),
+                "alert_status": alert_status,
+                "pca": {
+                    "pc1": round(pca_coords["pc1"], 4),
+                    "pc2": round(pca_coords["pc2"], 4),
+                },
+            }
+
+            # Broadcast to all connected clients (dashboard + sender)
+            await manager.broadcast_json(result)
+
     except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
