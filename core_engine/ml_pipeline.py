@@ -1,7 +1,11 @@
 import os
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest, RandomForestRegressor
+import pandas as pd
+from sklearn.ensemble import IsolationForest, RandomForestRegressor, RandomForestClassifier
+from sklearn.neural_network import MLPRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score
@@ -13,14 +17,16 @@ logger = logging.getLogger(__name__)
 # Path to the datasets directory (relative to the core_engine folder)
 DATASETS_DIR = os.path.join(os.path.dirname(__file__), "..", "datasets")
 MODEL_PATH    = os.path.join(os.path.dirname(__file__), "trained_model.joblib")
-RUL_MODEL_PATH = os.path.join(os.path.dirname(__file__), "rul_model.joblib")
+MLP_MODEL_PATH = os.path.join(os.path.dirname(__file__), "mlp_model.joblib")
+GP_MODEL_PATH = os.path.join(os.path.dirname(__file__), "gp_model.joblib")
+CLF_MODEL_PATH = os.path.join(os.path.dirname(__file__), "clf_model.joblib")
 SCALER_PATH   = os.path.join(os.path.dirname(__file__), "scaler.joblib")
 PCA_PATH      = os.path.join(os.path.dirname(__file__), "pca_model.joblib")
 METRICS_PATH  = os.path.join(os.path.dirname(__file__), "metrics.joblib")
 VERSION_FILE  = os.path.join(os.path.dirname(__file__), "model_version.txt")
 
 # Bump this string any time you change the training dataset or feature set.
-MODEL_VERSION = "nasa_test4_v2_rul"
+MODEL_VERSION = "nasa_test4_v3_multimodels"
 
 
 class MLPipeline:
@@ -38,7 +44,9 @@ class MLPipeline:
     def __init__(self, contamination=0.05):
         self.contamination = contamination
         self.model: IsolationForest = None
-        self.rul_model: RandomForestRegressor = None
+        self.mlp_rul: MLPRegressor = None
+        self.gp_rul: GaussianProcessRegressor = None
+        self.clf: RandomForestClassifier = None
         self.scaler: StandardScaler = StandardScaler()
         self.pca: PCA = None
         self.is_trained = False
@@ -57,7 +65,8 @@ class MLPipeline:
 
     def _is_current_version(self) -> bool:
         """Return True only if saved models exist AND match MODEL_VERSION."""
-        if not all(os.path.exists(p) for p in [MODEL_PATH, RUL_MODEL_PATH, SCALER_PATH, PCA_PATH, METRICS_PATH]):
+        paths = [MODEL_PATH, MLP_MODEL_PATH, GP_MODEL_PATH, CLF_MODEL_PATH, SCALER_PATH, PCA_PATH, METRICS_PATH]
+        if not all(os.path.exists(p) for p in paths):
             return False
         if not os.path.exists(VERSION_FILE):
             return False
@@ -65,7 +74,7 @@ class MLPipeline:
             saved = f.read().strip()
         if saved != MODEL_VERSION:
             logger.info("Model version mismatch (saved=%s, current=%s) — retraining.", saved, MODEL_VERSION)
-            for p in [MODEL_PATH, RUL_MODEL_PATH, SCALER_PATH, PCA_PATH, METRICS_PATH, VERSION_FILE]:
+            for p in paths + [VERSION_FILE]:
                 try:
                     os.remove(p)
                 except OSError:
@@ -136,35 +145,64 @@ class MLPipeline:
         # Scale
         X_scaled = self.scaler.fit_transform(X)
 
-        # 1. IsolationForest (Anomaly Detection)
+        # 1. IsolationForest (Unsupervised Anomaly Detection)
         self.model = IsolationForest(
-            n_estimators=200,
-            contamination=self.contamination,
-            max_samples="auto",
-            random_state=42,
-            n_jobs=-1,
+            n_estimators=200, contamination=self.contamination,
+            max_samples="auto", random_state=42, n_jobs=-1
         )
         self.model.fit(X_scaled)
         
-        # 2. RUL Prediction Model (from Functional RUL analysis papers)
-        self.rul_model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42, n_jobs=-1)
-        self.rul_model.fit(X_scaled, data["true_rul"].values)
+        # 2. MLP Regressor (Functional MLP for RUL - Paper 1904.06442)
+        self.mlp_rul = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=200, random_state=42)
+        self.mlp_rul.fit(X_scaled, data["true_rul"].values)
+
+        # 3. Gaussian Process Regressor (Uncertainty-aware RUL - Paper 2104.03613)
+        # Train on a small subsample to avoid O(N^3) memory crash
+        subsample_idx = np.random.choice(len(X_scaled), min(len(X_scaled), 1000), replace=False)
+        kernel = C(1.0, (1e-3, 1e3)) * RBF(1.0, (1e-2, 1e2))
+        self.gp_rul = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=2, random_state=42)
+        self.gp_rul.fit(X_scaled[subsample_idx], data["true_rul"].values[subsample_idx])
+
+        # 4. Supervised Fault Classifier (Paper 2310.11477)
+        self.clf = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42, n_jobs=-1)
+        self.clf.fit(X_scaled, data["ground_truth_anomaly"].values)
 
         # Compute static metrics internally over cross-val-like training predictions
-        rul_preds = self.rul_model.predict(X_scaled)
-        mse = mean_squared_error(data["true_rul"], rul_preds)
-        mae = mean_absolute_error(data["true_rul"], rul_preds)
-        r2 = r2_score(data["true_rul"], rul_preds)
         
-        # IsolationForest accuracy
+        # Isolation Forest (Accuracy)
         if_preds = self.model.predict(X_scaled) == -1
-        acc = accuracy_score(data["ground_truth_anomaly"], if_preds)
+        if_acc = accuracy_score(data["ground_truth_anomaly"], if_preds)
+
+        # Supervised Classification (Accuracy)
+        clf_preds = self.clf.predict(X_scaled)
+        clf_acc = accuracy_score(data["ground_truth_anomaly"], clf_preds)
+
+        # Functional MLP (RUL)
+        mlp_preds = self.mlp_rul.predict(X_scaled)
+        mlp_mse = mean_squared_error(data["true_rul"], mlp_preds)
+        mlp_mae = mean_absolute_error(data["true_rul"], mlp_preds)
+        mlp_r2 = r2_score(data["true_rul"], mlp_preds)
+
+        # Gaussian Process (RUL)
+        gp_preds, gp_std = self.gp_rul.predict(X_scaled, return_std=True)
+        gp_mse = mean_squared_error(data["true_rul"], gp_preds)
+        gp_mae = mean_absolute_error(data["true_rul"], gp_preds)
+        gp_r2 = r2_score(data["true_rul"], gp_preds)
 
         self.static_metrics = {
-            "mse": round(float(mse), 2),
-            "mae": round(float(mae), 2),
-            "r2": round(float(r2), 4),
-            "accuracy": round(float(acc) * 100, 2)
+            "isolation_forest": { "accuracy": round(float(if_acc) * 100, 2) },
+            "supervised_cnn_proxy": { "accuracy": round(float(clf_acc) * 100, 2) },
+            "functional_mlp": {
+                "mse": round(float(mlp_mse), 2),
+                "mae": round(float(mlp_mae), 2),
+                "r2": round(float(mlp_r2), 4)
+            },
+            "gaussian_process": {
+                "mse": round(float(gp_mse), 2),
+                "mae": round(float(gp_mae), 2),
+                "r2": round(float(gp_r2), 4),
+                "avg_uncertainty": round(float(np.mean(gp_std)), 2)
+            }
         }
 
         # PCA (2 components for visualization)
@@ -188,10 +226,12 @@ class MLPipeline:
 
     def _save_models(self):
         try:
-            joblib.dump(self.model,  MODEL_PATH)
-            joblib.dump(self.rul_model, RUL_MODEL_PATH)
-            joblib.dump(self.scaler, SCALER_PATH)
-            joblib.dump(self.pca,    PCA_PATH)
+            joblib.dump(self.model,   MODEL_PATH)
+            joblib.dump(self.mlp_rul, MLP_MODEL_PATH)
+            joblib.dump(self.gp_rul,  GP_MODEL_PATH)
+            joblib.dump(self.clf,     CLF_MODEL_PATH)
+            joblib.dump(self.scaler,  SCALER_PATH)
+            joblib.dump(self.pca,     PCA_PATH)
             joblib.dump(self.static_metrics, METRICS_PATH)
             with open(VERSION_FILE, "w") as f:
                 f.write(MODEL_VERSION)
@@ -201,11 +241,14 @@ class MLPipeline:
 
     def _load_saved_models(self):
         try:
-            if all(os.path.exists(p) for p in [MODEL_PATH, RUL_MODEL_PATH, SCALER_PATH, PCA_PATH, METRICS_PATH]):
-                self.model  = joblib.load(MODEL_PATH)
-                self.rul_model = joblib.load(RUL_MODEL_PATH)
-                self.scaler = joblib.load(SCALER_PATH)
-                self.pca    = joblib.load(PCA_PATH)
+            paths = [MODEL_PATH, MLP_MODEL_PATH, GP_MODEL_PATH, CLF_MODEL_PATH, SCALER_PATH, PCA_PATH, METRICS_PATH]
+            if all(os.path.exists(p) for p in paths):
+                self.model   = joblib.load(MODEL_PATH)
+                self.mlp_rul = joblib.load(MLP_MODEL_PATH)
+                self.gp_rul  = joblib.load(GP_MODEL_PATH)
+                self.clf     = joblib.load(CLF_MODEL_PATH)
+                self.scaler  = joblib.load(SCALER_PATH)
+                self.pca     = joblib.load(PCA_PATH)
                 self.static_metrics = joblib.load(METRICS_PATH)
                 self.is_trained = True
                 self._rebuild_cache()
