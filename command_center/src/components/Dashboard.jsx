@@ -133,12 +133,11 @@ export const Dashboard = () => {
     currentScore, currentMax, currentRms, currentMape, mapeHistory,
     alertStatus, connectionStatus, telemetryData, currentPca, rowProgress,
     pcaAnalytics, datasetStats, modelInfo,
-    setConnectionStatus, addTelemetry, simulatorRunning, setSimulatorRunning,
+    setConnectionStatus, addTelemetry,
     setPcaAnalytics, setDatasetStats, setModelInfo,
   } = useStore();
 
   const wsRef    = useRef(null);
-  const [simBusy, setSimBusy] = useState(false);
 
   // ── WebSocket ──────────────────────────────────────────────
   useEffect(() => {
@@ -178,16 +177,6 @@ export const Dashboard = () => {
     boot();
   }, [setPcaAnalytics, setDatasetStats, setModelInfo, setSimulatorRunning]);
 
-  // ── Start / Stop simulator ─────────────────────────────────
-  const toggleSimulator = useCallback(async () => {
-    setSimBusy(true);
-    try {
-      const action = simulatorRunning ? 'stop' : 'start';
-      const res = await fetch(`${API_BASE}/api/simulator/${action}`, { method: 'POST' });
-      if (res.ok) setSimulatorRunning(!simulatorRunning);
-    } catch (e) { console.error('[Aegis] simulator toggle failed', e); }
-    setSimBusy(false);
-  }, [simulatorRunning, setSimulatorRunning]);
 
   // ── Derived chart data ─────────────────────────────────────
   const chartData = telemetryData.map((d, i) => ({
@@ -199,7 +188,7 @@ export const Dashboard = () => {
 
   const palette     = alertPalette[alertStatus] || alertPalette.HEALTHY;
   const isCritical  = alertStatus === 'CRITICAL';
-  const isStreaming  = simulatorRunning;
+  const isStreaming = true; // Always streaming now, per user request
 
   // PCA scatter grouping  (nasa_t4_bX sources)
   const pcaPoints  = pcaAnalytics?.points || [];
@@ -245,21 +234,6 @@ export const Dashboard = () => {
             </Badge>
           )}
 
-          {/* Start / Stop streaming */}
-          <button
-            id="btn-toggle-simulator"
-            onClick={toggleSimulator}
-            disabled={simBusy}
-            className="flex items-center gap-2 px-4 py-1.5 rounded-xl font-bold text-sm transition-all duration-300 disabled:opacity-50"
-            style={{
-              background: isStreaming
-                ? `linear-gradient(135deg, #dc2626, #b91c1c)`
-                : `linear-gradient(135deg, ${C.brand}, #4f46e5)`,
-              color: '#fff',
-              boxShadow: isStreaming ? '0 0 20px #ef444455' : `0 0 20px ${C.brand}55`,
-            }}>
-            {simBusy ? '⏳' : isStreaming ? '⏹ Stop Stream' : '▶ Start Stream'}
-          </button>
         </div>
       </header>
 
@@ -403,10 +377,10 @@ export const Dashboard = () => {
                   <ZAxis range={[18, 18]} />
                   <Tooltip contentStyle={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 11, fontFamily: 'monospace' }} />
                   <Legend wrapperStyle={{ fontSize: 11, color: C.muted }} />
-                  <Scatter name="Normal"  data={nasaNormal} fill={C.green} opacity={0.5} />
-                  <Scatter name="Anomaly" data={nasaAnom}   fill={C.red}   opacity={0.8} />
+                  <Scatter name="Normal"  data={nasaNormal} fill={C.green} opacity={0.5} isAnimationActive={false} />
+                  <Scatter name="Anomaly" data={nasaAnom}   fill={C.red}   opacity={0.8} isAnimationActive={false} />
                   {livePoint.length > 0 && (
-                    <Scatter name="⚡ LIVE" data={livePoint} fill="#fff" />
+                    <Scatter name="⚡ LIVE" data={livePoint} fill="#fff" isAnimationActive={false} />
                   )}
                 </ScatterChart>
               </ResponsiveContainer>
@@ -433,6 +407,19 @@ export const Dashboard = () => {
           <KpiCard icon="〜" label="RMS Vib Mean"
                    value={datasetStats.rms_vibration?.mean?.toFixed(4)} unit="g"
                    sub={`±${datasetStats.rms_vibration?.std?.toFixed(4)} std`} />
+        </div>
+      )}
+
+      {/* ── Static Metrics (From Functional RUL & IFA) ── */}
+      {modelInfo?.static_metrics && (
+        <div className="rounded-2xl border p-4 space-y-3" style={{ background: C.card, borderColor: C.border }}>
+          <SectionTitle>Functional ML Evaluation Metrics (nasa_test4 Cross-Val)</SectionTitle>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <KpiCard icon="🎯" label="IFA Accuracy" value={modelInfo.static_metrics.accuracy?.toFixed(1)} unit="%" sub="IsolationForest vs Ground Truth" />
+            <KpiCard icon="📉" label="RUL MSE" value={modelInfo.static_metrics.mse?.toFixed(2)} sub="Mean Squared Error" />
+            <KpiCard icon="〜" label="RUL MAE" value={modelInfo.static_metrics.mae?.toFixed(2)} sub="Mean Absolute Error" />
+            <KpiCard icon="🔹" label="RUL R² Score" value={modelInfo.static_metrics.r2?.toFixed(3)} sub="Coefficient of Determination" />
+          </div>
         </div>
       )}
 

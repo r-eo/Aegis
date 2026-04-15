@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 ml_pipeline: MLPipeline           = None
 telemetry_processor: TelemetryProcessor = None
-simulator_running: bool           = False   # starts PAUSED — user clicks Start
 mape_window: deque                = deque(maxlen=50)  # rolling window for MAPE
 
 
@@ -98,8 +97,6 @@ def _calc_mape(window: deque) -> float:
 # In-process CSV Simulator  (nasa_test2_features)
 # ─────────────────────────────────────────────────────────────
 async def _run_csv_simulator():
-    global simulator_running
-
     await asyncio.sleep(2)   # wait for server to fully start
 
     try:
@@ -119,9 +116,6 @@ async def _run_csv_simulator():
 
     while True:
         try:
-            if not simulator_running:
-                await asyncio.sleep(0.2)
-                continue
 
             row     = df.iloc[idx % total]
             max_vib = float(row["max_vibration"])
@@ -173,7 +167,7 @@ async def lifespan(app: FastAPI):
     logger.info("✅ ML pipeline ready.")
 
     sim_task = asyncio.create_task(_run_csv_simulator())
-    logger.info("🎬 Simulator task created (paused — awaiting /api/simulator/start).")
+    logger.info("🎬 Simulator task started (continuous streaming).")
 
     yield
 
@@ -210,36 +204,16 @@ async def health():
     return {
         "status": "healthy",
         "model_ready": ml_pipeline.is_trained if ml_pipeline else False,
-        "simulator_running": simulator_running,
         "active_ws_connections": len(manager.active_connections),
         "simulator_hz": SIMULATOR_HZ,
         "timestamp": time.time(),
     }
 
 
-@app.post("/api/simulator/start", tags=["Control"])
-async def simulator_start():
-    """Begin streaming nasa_test2 data through the ML pipeline."""
-    global simulator_running
-    simulator_running = True
-    mape_window.clear()
-    logger.info("[API] Simulator STARTED")
-    return {"status": "started", "simulator_hz": SIMULATOR_HZ}
-
-
-@app.post("/api/simulator/stop", tags=["Control"])
-async def simulator_stop():
-    """Pause the NASA test2 data stream."""
-    global simulator_running
-    simulator_running = False
-    logger.info("[API] Simulator STOPPED")
-    return {"status": "stopped"}
-
-
 @app.get("/api/simulator/status", tags=["Control"])
 async def simulator_status():
     return {
-        "running": simulator_running,
+        "running": True,
         "hz": SIMULATOR_HZ,
         "mape_window_size": len(mape_window),
         "current_mape": _calc_mape(mape_window),
@@ -297,7 +271,7 @@ async def dataset_stats():
 async def telemetry_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     # Send simulator status immediately on connect
-    await websocket.send_json({"type": "status", "simulator_running": simulator_running})
+    await websocket.send_json({"type": "status", "simulator_running": True})
     try:
         while True:
             raw = await websocket.receive_text()
