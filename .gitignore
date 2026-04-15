@@ -1,0 +1,18 @@
+# Data
+datasets_ziped/
+node_modules
+
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node / Vite (Frontend)
+command_center/node_modules/
+command_center/dist/
+command_center/.env
+
+# OS Files
+.DS_Store
+Thumbs.db
